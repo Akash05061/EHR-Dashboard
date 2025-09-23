@@ -1,25 +1,32 @@
 import { NextRequest, NextResponse } from 'next/server'
 import AthenaAPI from '@/app/lib/athena-api'
-import { apiCache } from '@/app/lib/api-cache'
+import { cookies } from 'next/headers'
 
-
-const athenaAPI = new AthenaAPI({
-  clientId: process.env.ATHENA_CLIENT_ID!,
-  clientSecret: process.env.ATHENA_CLIENT_SECRET!,
-  baseUrl: process.env.ATHENA_BASE_URL!
-})
+function getClinicSession() {
+  const sessionCookie = cookies().get('athena_session')
+  if (!sessionCookie) {
+    throw new Error('No clinic session found')
+  }
+  
+  try {
+    return JSON.parse(Buffer.from(sessionCookie.value, 'base64').toString())
+  } catch (error) {
+    throw new Error('Invalid session data')
+  }
+}
 
 export async function GET(request: NextRequest) {
   try {
     const { searchParams } = new URL(request.url)
     const action = searchParams.get('action')
-    const contextId = searchParams.get('contextId') || '195900'
+    
+    // Get clinic session from OAuth
+    const session = getClinicSession()
+    const athenaAPI = new AthenaAPI(session)
 
     switch (action) {
       case 'test':
-        console.log('Testing Athena connection...')
-        console.log('Client ID:', process.env.ATHENA_CLIENT_ID)
-        console.log('Base URL:', process.env.ATHENA_BASE_URL)
+        console.log('Testing Athena connection for clinic:', session.clinicId)
         
         const result = await athenaAPI.testConnection()
         console.log('Athena test result:', result)
@@ -44,19 +51,19 @@ export async function GET(request: NextRequest) {
         Object.keys(patientParams).forEach(
           (key) => patientParams[key as keyof typeof patientParams] === null && delete patientParams[key as keyof typeof patientParams]
         )
-        return NextResponse.json(await athenaAPI.searchPatients(patientParams, contextId))
+        return NextResponse.json(await athenaAPI.searchPatients(patientParams))
       
       case 'patient':
         const patientId = searchParams.get('id')
         if (!patientId) {
           return NextResponse.json({ success: false, error: 'Patient ID required' })
         }
-        return NextResponse.json(await athenaAPI.getPatient(patientId, contextId))
+        return NextResponse.json(await athenaAPI.getPatient(patientId))
       
       case 'patient-range':
         const startId = parseInt(searchParams.get('startId') || '60117')
         const endId = parseInt(searchParams.get('endId') || '60190')
-        return NextResponse.json(await athenaAPI.getPatientRange(startId, endId, contextId))
+        return NextResponse.json(await athenaAPI.getPatientRange(startId, endId, session.practiceId))
       
       case 'appointments':
         const appointmentParams = {
@@ -72,7 +79,7 @@ export async function GET(request: NextRequest) {
         )
         
         return NextResponse.json(
-          await athenaAPI.getAppointments(contextId, appointmentParams)
+          await athenaAPI.getAppointments(appointmentParams)
         )
       
       case 'appointment-confirmation-status':

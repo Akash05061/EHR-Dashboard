@@ -1,27 +1,21 @@
 import axios, { AxiosInstance } from 'axios'
 
-interface AthenaCredentials {
-  clientId: string
-  clientSecret: string
-  baseUrl: string
-}
-
-interface AthenaTokenResponse {
-  access_token: string
-  token_type: string
-  expires_in: number
+interface ClinicSession {
+  accessToken: string
+  refreshToken?: string
+  expiresAt: number
+  clinicId: string
+  practiceId: string
 }
 
 class AthenaAPI {
   private client: AxiosInstance
-  private credentials: AthenaCredentials
-  private accessToken: string | null = null
-  private tokenExpiry: number = 0
+  private session: ClinicSession | null = null
 
-  constructor(credentials: AthenaCredentials) {
-    this.credentials = credentials
+  constructor(session?: ClinicSession) {
+    this.session = session
     this.client = axios.create({
-      baseURL: credentials.baseUrl,
+      baseURL: process.env.ATHENA_BASE_URL!,
       timeout: 30000,
       headers: {
         'Content-Type': 'application/json',
@@ -30,9 +24,8 @@ class AthenaAPI {
     })
 
     this.client.interceptors.request.use(async (config) => {
-      await this.ensureValidToken()
-      if (this.accessToken) {
-        config.headers['Authorization'] = `Bearer ${this.accessToken}`
+      if (this.session?.accessToken) {
+        config.headers['Authorization'] = `Bearer ${this.session.accessToken}`
       }
       return config
     })
@@ -41,52 +34,26 @@ class AthenaAPI {
       (response) => response,
       async (error) => {
         if (error.response?.status === 401) {
-          this.accessToken = null
-          this.tokenExpiry = 0
-          await this.ensureValidToken()
-          return this.client.request(error.config)
+          throw new Error('Session expired. Please login again.')
         }
         return Promise.reject(error)
       }
     )
   }
 
-  private async ensureValidToken() {
-    if (this.accessToken && Date.now() < this.tokenExpiry) {
-      console.log('Using existing Athena token')
-      return
+  private validateSession() {
+    if (!this.session) {
+      throw new Error('No clinic session available. Please login.')
     }
-
-    console.log('Getting new Athena token...')
-    console.log('Auth URL:', `${this.credentials.baseUrl}/oauth2/v1/token`)
-    console.log('Client ID:', this.credentials.clientId)
-    
-    const response = await axios.post(
-      `${this.credentials.baseUrl}/oauth2/v1/token`,
-      new URLSearchParams({
-        grant_type: 'client_credentials',
-        scope: 'athena/service/Athenanet.MDP.* system/Patient.read system/Patient.rs system/Patient.s'
-      }),
-      {
-        headers: {
-          'Content-Type': 'application/x-www-form-urlencoded',
-          'Authorization': `Basic ${Buffer.from(`${this.credentials.clientId}:${this.credentials.clientSecret}`).toString('base64')}`
-        }
-      }
-    )
-
-    console.log('Token response status:', response.status)
-    console.log('Token response data:', response.data)
-    
-    const tokenData: AthenaTokenResponse = response.data
-    this.accessToken = tokenData.access_token
-    this.tokenExpiry = Date.now() + (tokenData.expires_in * 1000) - 60000
-    
-    console.log('Athena token obtained successfully')
+    if (Date.now() > this.session.expiresAt) {
+      throw new Error('Session expired. Please login again.')
+    }
   }
 
   // Patient Management - FHIR R4 and v1 API
-  async searchPatients(params: any = {}, contextId: string = '195900') {
+  async searchPatients(params: any = {}) {
+    this.validateSession()
+    const contextId = this.session!.practiceId
     const { given, family, name, birthdate, gender, identifier, _count, ...otherParams } = params
     
     // Use FHIR R4 if we have proper FHIR search parameters
@@ -128,12 +95,16 @@ class AthenaAPI {
     }
   }
 
-  async getPatient(patientId: string, contextId: string = '195900') {
+  async getPatient(patientId: string) {
+    this.validateSession()
+    const contextId = this.session!.practiceId
     const response = await this.client.get(`/v1/${contextId}/patients/${patientId}`)
     return { success: true, data: response.data }
   }
 
-  async createPatient(patientData: any, contextId: string = '195900') {
+  async createPatient(patientData: any) {
+    this.validateSession()
+    const contextId = this.session!.practiceId
     try {
       const response = await this.client.post(`/v1/${contextId}/patients`, patientData)
       return { success: true, data: response.data }
@@ -142,7 +113,9 @@ class AthenaAPI {
     }
   }
 
-  async updatePatient(patientId: string, updates: any, contextId: string = '195900') {
+  async updatePatient(patientId: string, updates: any) {
+    this.validateSession()
+    const contextId = this.session!.practiceId
     try {
       const response = await this.client.put(`/v1/${contextId}/patients/${patientId}`, updates)
       return { success: true, data: response.data }
@@ -152,7 +125,9 @@ class AthenaAPI {
   }
 
   // Appointment Management - v1 API
-  async getAppointments(contextId: string = '195900', params: any = {}) {
+  async getAppointments(params: any = {}) {
+    this.validateSession()
+    const contextId = this.session!.practiceId
     const response = await this.client.get(`/v1/${contextId}/appointments`, { params })
     return { success: true, data: response.data }
   }
@@ -175,23 +150,20 @@ class AthenaAPI {
 
   // Test connection
   async testConnection() {
-    console.log('Starting Athena connection test...')
+    this.validateSession()
+    const contextId = this.session!.practiceId
     
-    await this.ensureValidToken()
-    console.log('Token obtained, testing v1 API endpoint first...')
+    console.log('Testing Athena connection for clinic:', this.session!.clinicId)
     
     try {
-      // Test v1 API first
-      const v1Response = await this.client.get('/v1/195900/patients/60178')
-      console.log('v1 API response status:', v1Response.status)
+      // Test user info endpoint
+      const userResponse = await this.client.get('/oauth2/v1/userinfo')
+      console.log('User info response:', userResponse.status)
       
-      // Now try FHIR R4
-      console.log('Testing FHIR R4 patient search...')
+      // Test FHIR R4 with user scope
       const fhirResponse = await this.client.get('/fhir/r4/Patient', {
         params: {
-          'ah-practice': 'Organization/a-1.Practice-195900',
-          'given': 'Jo',
-          'family': 'Smith',
+          'ah-practice': `Organization/a-1.Practice-${contextId}`,
           '_count': '1'
         },
         headers: {
@@ -199,26 +171,19 @@ class AthenaAPI {
         }
       })
       
-      console.log('FHIR response status:', fhirResponse.status)
-      
       return {
         success: true,
         data: {
-          v1: v1Response.data,
+          user: userResponse.data,
           fhir: fhirResponse.data
         },
-        message: `Athena Health API connection successful - Both v1 and FHIR working`
+        message: `Connected to ${this.session!.clinicId} - OAuth working`
       }
     } catch (error: any) {
-      console.log('FHIR failed, using v1 only:', error.message)
-      
-      // Fallback to v1 only
-      const v1Response = await this.client.get('/v1/195900/patients/60178')
-      
       return {
-        success: true,
-        data: v1Response.data,
-        message: `Athena Health v1 API connection successful (FHIR not available: ${error.message})`
+        success: false,
+        error: error.message,
+        message: 'Connection test failed'
       }
     }
   }
